@@ -1,0 +1,15 @@
+**/data/*
+**/models/*
+
+# Log files
+**/log.org
+**/*.log
+
+# Model extensions not to save
+*.chkpnt
+*.pickle
+
+# Compress McMaster model step files
+design/mcmaster-models/*.step
+
+**/.DS_Store
