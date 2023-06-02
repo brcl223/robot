@@ -10,6 +10,9 @@ import pathlib
 
 
 
+# Number motor rotations per one link rotation
+MOTOR_LINK_RATIO = 6
+
 
 def load_nn(model_path, hidden=100):
     INPUTS = 1
@@ -42,11 +45,11 @@ def find_run_num():
             # print(f"Filename: {filename.name}")
             # print(f"Selected substring: {filename.name[run_str_start:run_str_start+3]}")
             max_seen = max(max_seen, int(filename.name[run_str_start:run_str_start+3]))
-    return max_seen + 1
+    return max_seen
 
 
 pathlib.Path(DATADIR).mkdir(parents=False, exist_ok=True)
-RUN=find_run_num()
+RUN = find_run_num() + 1
 print(f"Beginning run {RUN}...")
 # import sys; sys.exit(0)
 MAX_TORQUE = 0.15 # Units Nm
@@ -102,7 +105,7 @@ def discrete_lowpass(x, y_prev, alpha=0.5):
 
 async def main():
     print("Loading network...")
-    model_path = "./models/test-test-2_nodes-model_4.chkpnt"
+    model_path = "./models/test-test-3_nodes-model_4.chkpnt"
     holding_torques = load_nn(model_path)
     print("Network loaded!\n\n")
 
@@ -124,7 +127,8 @@ async def main():
 
     # points = sampler(POINTS_TO_COLLECT, q_min=-4., q_max=4.)
     # Go from 0 -> END, END -> 0, 0 -> -END, -END -> 0
-    END = 4*math.pi
+    # Units: Rotations of motor (link is 1 rotation / 6 rotations motor)
+    END = 12
     points1 = sampler(POINTS_TO_COLLECT, q_min=0., q_max=END)
     points2 = np.copy(points1)[::-1]
     points3 = sampler(POINTS_TO_COLLECT, q_min=-END, q_max=0.)[::-1]
@@ -135,10 +139,11 @@ async def main():
     for point in points:
         reset = True
         qd = point
-        nn_torque = holding_torques(torch.tensor([(qd + 8*math.pi) % 2*math.pi])).detach().numpy()[0]
+        qd_nn_input = qd % MOTOR_LINK_RATIO
+        nn_torque = holding_torques(torch.tensor([qd_nn_input])).detach().numpy()[0]
 
         print(f"Moving to desired qd: {qd}")
-        print(f"Input qd: {(qd + 8*math.pi) % (2*math.pi)}")
+        print(f"Input qd: {qd_nn_input}")
         print(f"Predicted NN Holding Torque: {nn_torque}")
 
         while not is_stopped(q_dot, reset=reset):

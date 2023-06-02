@@ -5,9 +5,10 @@ import math
 import collections
 import os
 import pathlib
+import time
 
 
-DATADIR="./data/collection/"
+DATADIR="./data/collection/dynamic/"
 
 #123456789abc
 #cba987654321
@@ -22,11 +23,11 @@ def find_run_num():
             # print(f"Filename: {filename.name}")
             # print(f"Selected substring: {filename.name[run_str_start:run_str_start+3]}")
             max_seen = max(max_seen, int(filename.name[run_str_start:run_str_start+3]))
-    return max_seen + 1
+    return max_seen
 
 
 pathlib.Path(DATADIR).mkdir(parents=False, exist_ok=True)
-RUN=find_run_num()
+RUN=find_run_num() + 1
 print(f"Beginning run {RUN}...")
 # import sys; sys.exit(0)
 MAX_TORQUE = 0.15 # Units Nm
@@ -38,6 +39,10 @@ def sampler(samples, q_min=-2., q_max=2.):
     q_min = max(q_min, -20.)
     q_max = min(q_max, 20.)
     return np.linspace(q_min, q_max, samples, endpoint=True)
+
+
+def gen_next_point(qd_0, qd_dot, dt):
+    return qd_0 + qd_dot * dt
 
 
 VEL_SAMPLES = 50
@@ -80,6 +85,19 @@ def discrete_lowpass(x, y_prev, alpha=0.5):
     return alpha * x + (1 - alpha) * y_prev
 
 
+ctr = 0
+def after_num_ms(t_now, t_start, ms, reset=False):
+    global ctr
+    if reset: ctr = 0
+
+    dt_ms = (t_now - t_start) * 1000
+    if (ms + ctr * ms) < dt_ms:
+        ctr += 1
+        return True
+    else:
+        return False
+
+
 async def main():
     c = moteus.Controller()
 
@@ -87,82 +105,83 @@ async def main():
     await c.set_stop()
     q = 0.
     q_dot = 0.
-    qd_dot = 0.
-    torque = 0
+    qd_dot = 0.1 # Want constant velocity
+    torque = torque_filtered = 0
 
     collected_q = []
+    collected_q_dot = []
     collected_t = []
+    collected_t_filtered = []
+    collected_freq = []
 
-    POINTS_TO_COLLECT = 250
+    # Get initial reading
+    state = await c.set_position(position=math.nan, kp_scale=0, kd_scale=0, query=True)
+    qd_0 = state.values[moteus.Register.POSITION]
 
-    # points = sampler(POINTS_TO_COLLECT, q_min=-4., q_max=4.)
-    # Go from 0 -> END, END -> 0, 0 -> -END, -END -> 0
-    END = 4*math.pi
-    points1 = sampler(POINTS_TO_COLLECT, q_min=0., q_max=END)
-    points2 = np.copy(points1)[::-1]
-    points3 = sampler(POINTS_TO_COLLECT, q_min=-END, q_max=0.)[::-1]
-    points4 = np.copy(points3)[::-1]
-    points = np.concatenate((points1, points2, points3, points4))
+    # Units: seconds
+    COLLECTION_TIME = 3
+    t_start = t_prev = time.time()
 
-    for point in points:
-        reset = True
-        qd = point
 
-        print(f"Moving to desired qd: {qd}")
+    # Initial guess of dt
+    # Seems to be a decent ballpark figure
+    dt = 1./300
+    while (t_prev - t_start) < COLLECTION_TIME:
+        t_now = time.time()
+        dt = discrete_lowpass(t_now - t_prev, dt, alpha=0.6)
+        qd = gen_next_point(qd_0, qd_dot, dt)
 
-        while not is_stopped(q_dot, reset=reset):
-            reset = False
-            state = await c.set_position(position=math.nan,
+        state = await c.set_position(position=math.nan,
                                      kp_scale=0, kd_scale=0,
-                                     feedforward_torque=torque, maximum_torque=MAX_TORQUE,
+                                     feedforward_torque=torque_filtered, maximum_torque=MAX_TORQUE,
                                      query=True)
-            # state = await c.set_position(position=math.nan, kp_scale=0, kd_scale=0, query=True)
+        # state = await c.set_position(position=math.nan,
+        #                              kp_scale=0, kd_scale=0,
+        #                              feedforward_torque=0, maximum_torque=MAX_TORQUE,
+        #                              query=True)
 
-            # print(state)
+        q = state.values[moteus.Register.POSITION]
+        q_dot = state.values[moteus.Register.VELOCITY]
 
-            q = state.values[moteus.Register.POSITION]
-            q_dot = state.values[moteus.Register.VELOCITY]
+        torque = pid_control(q, q_dot, qd, qd_dot, Ki=0, Kp=0.3, Kd=0.05)
+        torque_filtered = discrete_lowpass(torque, torque_filtered, alpha=0.99)
 
-            torque = pid_control(q, q_dot, qd, qd_dot, Ki = 0, Kp = 0.2, Kd = 0.03)
-            # print(f"\nCommanded Torque: {torque}")
-            # print(f"Read torque: {state.values[moteus.Register.TORQUE]}\n")
-
-            await asyncio.sleep(0.02)
-
-        print(f"Stopped!\nq: {q}\nTorque: {torque}\n")
         collected_q.append(q)
+        collected_q_dot.append(q_dot)
         collected_t.append(torque)
+        collected_t_filtered.append(torque_filtered)
+        collected_freq.append(1/dt)
+
+        if after_num_ms(t_now, t_start, 500):
+            print("########################################")
+            print(f"Time [s]: {t_now - t_start}")
+            print(f"Torque [Nm]: {torque}")
+            print(f"Position [rot]: {q}")
+            print(f"Desired Position [rot]: {qd}")
+            print(f"Velocity [rot/s]: {q_dot}")
+            print(f"Desired Velocity [rot/s]: {qd_dot}")
+            print("########################################\n\n\n")
+
+        t_prev = t_now
+        qd_0 = qd
+
+        await asyncio.sleep(0.005)
+
 
     print("Saving collected data...")
-    np.save(f"./data/collected_q.run-{RUN:03d}.npy", collected_q)
-    np.save(f"./data/collected_t.run-{RUN:03d}.npy", collected_t)
+    np.save(f"{DATADIR}/collected_q.run-{RUN:03d}.npy", collected_q)
+    np.save(f"{DATADIR}/collected_q_dot.run-{RUN:03d}.npy", collected_q_dot)
+    np.save(f"{DATADIR}/collected_t.run-{RUN:03d}.npy", collected_t)
+    np.save(f"{DATADIR}/collected_t_filtered.run-{RUN:03d}.npy", collected_t_filtered)
     print("Data saved!")
 
+    collected_freq = collected_freq[10:]
+    avg = lambda l : sum(l) / len(l)
+    print(f"Average Frequency: {avg(collected_freq)}\nMax: {max(collected_freq)}\nMin: {min(collected_freq)}")
 
-    # while True:
-    #     # Be VERY careful with the commanded feedforward_torque
-    #     # kp_scale = kd_scale = 0 => pure feedforward_torque controller
-    #     # state = await c.set_position(position=math.nan, kp_scale=0, kd_scale=0, feedforward_torque=0.001, query=True)
-    #     state = await c.set_position(position=math.nan,
-    #                                  kp_scale=0, kd_scale=0,
-    #                                  feedforward_torque=torque, maximum_torque=MAX_TORQUE,
-    #                                  query=True)
-    #     # state = await c.set_position(position=math.nan, kp_scale=0, kd_scale=0, query=True)
-
-    #     print(state)
-
-    #     q_cur = state.values[moteus.Register.POSITION]
-    #     q_dot_cur = state.values[moteus.Register.VELOCITY]
-    #     q = discrete_lowpass(q_cur, q)
-    #     q_dot = discrete_lowpass(q_dot_cur, q_dot)
-    #     qd = 2.0
-    #     qd_dot = 0.
-
-    #     torque = pid_control(q, q_dot, qd, qd_dot, Ki = 0, Kp = 0.18, Kd = 0.025)
-    #     print(f"\nCommanded Torque: {torque}")
-    #     print(f"Read torque: {state.values[moteus.Register.TORQUE]}\n")
-
-    #     await asyncio.sleep(0.02)
+    import matplotlib.pyplot as plt
+    plt.plot(collected_freq)
+    plt.show()
 
 
 async def disable_motor():
